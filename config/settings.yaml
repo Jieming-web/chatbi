@@ -1,0 +1,23 @@
+embedding:
+  model_name: "all-MiniLM-L6-v2"
+
+retriever:
+  type: "hybrid"
+  top_k: 10
+  final_tables: 6
+
+reranker:
+  type: "llm"
+  top_k: 6
+  model_name: null
+
+llm:
+  model: "gpt-4o"
+  temperature: 0
+
+db:
+  path: "Ecommerce.db"
+
+mcp:
+  port: 8787
+  fallback_on_error: true

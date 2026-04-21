@@ -1,0 +1,14 @@
+mcp==1.10.0
+openai==1.75.0
+langchain==0.3.25
+langchain-openai==0.3.18
+langgraph==0.5.3
+langchain-mcp-adapters==0.1.14
+pymysql==1.0.3
+colorama==0.4.6
+pandas
+pyyaml
+pydantic
+rank_bm25
+sentence-transformers
+rapidfuzz

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Database (data files, not tracked in repo)
+Ecommerce.db
+*.sqlite
+
+# Vector store indexes (regenerated locally)
+db_mcp_server/chroma_entities/
+db_mcp_server/milvus_entities.db
+db_mcp_server/.milvus_entities.db.lock
+
+# Eval reports (generated outputs)
+evals/reports/
+
+# Environment
+.env
+*.env
