@@ -16,7 +16,7 @@ llm:
   temperature: 0
 
 db:
-  path: "Ecommerce.db"
+  path: "data/Ecommerce.db"
 
 mcp:
   port: 8787

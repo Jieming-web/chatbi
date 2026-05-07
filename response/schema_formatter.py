@@ -34,12 +34,12 @@ def format_roles(roles: dict) -> str:
         if isinstance(e, dict)
     ]
     lines = []
-    if roles.get("metric"):      lines.append(f"- 指标：{', '.join(roles['metric'])}")
-    if roles.get("time"):        lines.append(f"- 时间：{', '.join(roles['time'])}")
-    if roles.get("comparison"):  lines.append(f"- 比较/排序：{', '.join(roles['comparison'])}")
-    if roles.get("status"):      lines.append(f"- 状态过滤：{', '.join(roles['status'])}")
-    if roles.get("aggregation"): lines.append(f"- 分组维度：{', '.join(roles['aggregation'])}")
-    if roles.get("limit"):       lines.append(f"- 数量限制：{', '.join(roles['limit'])}")
-    if entity_names:             lines.append(f"- 实体过滤：{', '.join(entity_names)}")
-    if location_names:           lines.append(f"- 地点过滤：{', '.join(location_names)}")
+    if roles.get("metric"):      lines.append(f"- Metric: {', '.join(roles['metric'])}")
+    if roles.get("time"):        lines.append(f"- Time: {', '.join(roles['time'])}")
+    if roles.get("comparison"):  lines.append(f"- Comparison/Ranking: {', '.join(roles['comparison'])}")
+    if roles.get("status"):      lines.append(f"- Status Filter: {', '.join(roles['status'])}")
+    if roles.get("aggregation"): lines.append(f"- Grouping Dimension: {', '.join(roles['aggregation'])}")
+    if roles.get("limit"):       lines.append(f"- Limit: {', '.join(roles['limit'])}")
+    if entity_names:             lines.append(f"- Entity Filter: {', '.join(entity_names)}")
+    if location_names:           lines.append(f"- Location Filter: {', '.join(location_names)}")
     return "\n".join(lines) if lines else ""

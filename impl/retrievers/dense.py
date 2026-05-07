@@ -1,14 +1,20 @@
+import re
 from typing import List, Sequence, Tuple
 
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+import numpy as np
 
 from core.interfaces import BaseRetriever, RetrievalHit
 from core.registry import register_retriever
 
 
-COLLECTION_NAME = "schema_fields"
+def _tokenize(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9_]+", text.lower())
+    normalized = []
+    for token in tokens:
+        if len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+        normalized.append(token)
+    return normalized
 
 
 @register_retriever("dense")
@@ -21,44 +27,60 @@ class DenseRetriever(BaseRetriever):
     ):
         self.cfg = cfg
         self.field_descriptions = list(field_descriptions)
-        self.model = SentenceTransformer(embedding_model_name)
-        self.qdrant = QdrantClient(":memory:")
+        self.embedding_model_name = embedding_model_name
+        self.model = None
+        self._field_vectors = None
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            self.model = SentenceTransformer(embedding_model_name)
+        except Exception:
+            self.model = None
         self._build_index()
 
     def _build_index(self) -> None:
-        texts = [desc for _, _, desc in self.field_descriptions]
-        vectors = self.model.encode(texts, normalize_embeddings=True).tolist()
-        dim = len(vectors[0]) if vectors else 384
-        self.qdrant.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
-        )
-        points = [
-            PointStruct(
-                id=i,
-                vector=vectors[i],
-                payload={
-                    "table": self.field_descriptions[i][0],
-                    "field": self.field_descriptions[i][1],
-                },
-            )
-            for i in range(len(self.field_descriptions))
+        texts = [
+            f"{table} {field} {desc}"
+            for table, field, desc in self.field_descriptions
         ]
-        self.qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+        if self.model:
+            self._field_vectors = self.model.encode(
+                texts,
+                normalize_embeddings=True,
+            )
+            return
+
+        vocab = sorted({token for text in texts for token in _tokenize(text)})
+        self._vocab = {token: idx for idx, token in enumerate(vocab)}
+        vectors = np.zeros((len(texts), len(vocab)), dtype=float)
+        for row, text in enumerate(texts):
+            for token in _tokenize(text):
+                vectors[row, self._vocab[token]] += 1.0
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._field_vectors = vectors / norms
 
     def retrieve(self, query: str, top_k: int) -> List[RetrievalHit]:
-        q_vec = self.model.encode([query], normalize_embeddings=True)[0].tolist()
-        points = self.qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            query=q_vec,
-            limit=top_k,
-        ).points
+        if self.model:
+            q_vec = self.model.encode([query], normalize_embeddings=True)[0]
+        else:
+            q_vec = np.zeros(len(self._vocab), dtype=float)
+            for token in _tokenize(query):
+                idx = self._vocab.get(token)
+                if idx is not None:
+                    q_vec[idx] += 1.0
+            norm = np.linalg.norm(q_vec)
+            if norm:
+                q_vec = q_vec / norm
+
+        scores = np.dot(self._field_vectors, q_vec)
+        ranked = sorted(enumerate(scores), key=lambda x: -float(x[1]))
         return [
             RetrievalHit(
-                table=p.payload["table"],
-                field=p.payload["field"],
-                score=float(p.score),
-                field_idx=int(p.id),
+                table=self.field_descriptions[idx][0],
+                field=self.field_descriptions[idx][1],
+                score=float(score),
+                field_idx=idx,
             )
-            for p in points
+            for idx, score in ranked[:top_k]
         ]

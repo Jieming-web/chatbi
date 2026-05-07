@@ -1,29 +1,46 @@
 """
-实体候选检索模块（ChromaDB 版）
----------------------------------
-职责：从用户 query 中提取候选短语，通过两阶段分类决定每个短语属于哪个角色：
-  1. spaCy noun_chunks → 名词短语候选；NER DATE/TIME → 直接归 time 角色
-  2. ROLE_EXAMPLES embedding argmax vs ChromaDB entity 相似度 → 决定名词短语归属
+Entity candidate retrieval module (ChromaDB version)
+----------------------------------------------------
+Responsibility: extract candidate phrases from the user query and assign each phrase
+to a role with a two-stage classifier:
+  1. spaCy noun_chunks -> noun phrase candidates; NER DATE/TIME -> direct time role
+  2. ROLE_EXAMPLES embedding argmax vs ChromaDB entity similarity -> final role decision
 
-返回格式（get_candidates）：
+Return format (get_candidates):
   {
     "pre_classified": {"time": ["last month"], "metric": ["sales"]},
     "candidates": {
-      "samsng": {"top1": {"name": "Samsung", "group": "品牌", "score": 0.85}, "top2": {...}},
+      "samsng": {"top1": {"name": "Samsung", "group": "brand", "score": 0.85}, "top2": {...}},
     }
   }
-纠错决策由 client.py 的 normalize_node 交给 LLM 完成。
+The final correction decision is delegated to the LLM in client.py's normalize_node.
 """
 
 import os
+import re
 import sqlite3
 from typing import Optional
 
-import chromadb
-import numpy as np
-import spacy
+try:
+    import chromadb
+except Exception:
+    chromadb = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    import spacy
+except Exception:
+    spacy = None
 from rapidfuzz import fuzz, process as fuzz_process
-from sentence_transformers import SentenceTransformer
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 from db_mcp_server.utils import DB_PATH
 
@@ -47,17 +64,25 @@ _STOPWORDS = {
     "this", "that", "these", "those", "the", "a", "an", "is", "are", "was",
     "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
     "find", "show", "get", "give", "tell", "list", "count", "how", "why",
+    # business-intent words that often fuzzy-match nearby entities (e.g. sales->Salem)
+    "sales", "revenue", "orders", "order", "customer", "customers", "products",
+    "product", "reviews", "review", "ratings", "rating", "city", "country",
+    "state", "performance", "delivery", "shipping", "shipment", "shipments",
+    "cost", "buyers", "comparison", "breakdown", "fraud", "risk", "avg",
+    "average", "top", "most", "best", "month", "year", "quarter", "weekend",
+    # common verbs/adverbs that created false fuzzy hits like make->Makeup, well->Lowell
+    "make", "sell", "well", "doing",
 }
 CHROMA_PATH     = os.path.abspath(os.path.join(os.path.dirname(__file__), "chroma_entities"))
 
-# 每个非实体角色的代表短语，用于 embedding 语义匹配（仅英文）
-# 覆盖完整短语与单词缩写两类边缘情况
+# Representative phrases for each non-entity role, used for embedding-based
+# semantic matching. These examples cover both full phrases and short keyword cases.
 ROLE_EXAMPLES: dict[str, list[str]] = {
     "metric": [
         "total sales", "total revenue", "order count", "return rate",
         "inventory level", "profit margin", "average price",
         "gross margin", "conversion rate", "customer spend",
-        # 单词指标（含业务缩写）
+        # Single-word metrics, including business abbreviations.
         "GMV", "turnover", "income", "cost", "refund amount",
         "customer rating", "review score", "stock level", "order volume",
     ],
@@ -65,26 +90,26 @@ ROLE_EXAMPLES: dict[str, list[str]] = {
         "highest revenue", "lowest sales", "top performing",
         "year over year", "month over month", "ranked by",
         "compared to last year", "exceeds average",
-        # 单词比较词
+        # Single-word comparison cues.
         "vs", "versus", "best selling", "worst performing",
         "most popular", "least popular", "above average", "below average",
     ],
     "status": [
         "shipped orders", "pending payment", "cancelled items",
         "delivered packages", "refunded transactions",
-        # 补充状态词
+        # Additional status words.
         "returned items", "completed orders", "processing orders",
         "paid orders", "unpaid invoices", "canceled orders",
     ],
     "aggregation": [
         "group by brand", "by category", "each city",
         "per region", "broken down by",
-        # 单词聚合词
+        # Single-word aggregation cues.
         "across regions", "by area", "grouped by",
     ],
     "limit": [
         "top 5", "first 10", "top 3 brands", "bottom 5",
-        # 单词排序限定
+        # Single-word ranking and recency cues.
         "latest orders", "newest products", "oldest records",
     ],
 }
@@ -92,25 +117,65 @@ ROLE_EXAMPLES: dict[str, list[str]] = {
 
 class EntityNormalizer:
     def __init__(self):
-        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        self.nlp         = spacy.load("en_core_web_sm")
-        self.chroma      = chromadb.PersistentClient(path=CHROMA_PATH)
+        self.embed_model = None
+        self.nlp = None
+        self.chroma = None
+        if SentenceTransformer is not None:
+            try:
+                self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception:
+                self.embed_model = None
+        if spacy is not None:
+            try:
+                self.nlp = spacy.load("en_core_web_sm")
+            except Exception:
+                self.nlp = None
+        if chromadb is not None and self.embed_model is not None:
+            try:
+                self.chroma = chromadb.PersistentClient(path=CHROMA_PATH)
+            except Exception:
+                self.chroma = None
         self._load_entities()
         self._load_role_embeddings()
 
     # ─────────────────────────────────────────────
-    # 数据加载 & ChromaDB 索引构建
+    # Data loading and ChromaDB index construction
     # ─────────────────────────────────────────────
     def _load_entities(self):
         """Load entities from normalized tables into ChromaDB (skips rebuild if count matches)."""
         conn = sqlite3.connect(DB_PATH)
         cur  = conn.cursor()
 
-        cur.execute("SELECT DISTINCT City FROM Customer WHERE City IS NOT NULL")
-        cities = [r[0] for r in cur.fetchall()]
+        def extend_distinct(target: list[str], table: str, *column_candidates: str) -> None:
+            try:
+                cols = {
+                    row[1].lower(): row[1]
+                    for row in cur.execute(f'PRAGMA table_info("{table}")').fetchall()
+                }
+            except Exception:
+                return
+            for candidate in column_candidates:
+                real_name = cols.get(candidate.lower())
+                if not real_name:
+                    continue
+                cur.execute(
+                    f'SELECT DISTINCT "{real_name}" FROM "{table}" '
+                    f'WHERE "{real_name}" IS NOT NULL AND TRIM("{real_name}") != ""'
+                )
+                target.extend(r[0] for r in cur.fetchall())
+                return
 
-        cur.execute("SELECT DISTINCT Province FROM Customer WHERE Province IS NOT NULL")
-        states = [r[0] for r in cur.fetchall()]
+        cities: list[str] = []
+        states: list[str] = []
+        extend_distinct(cities, "Customer", "City")
+        extend_distinct(states, "Customer", "Province", "State", "Country")
+
+        # Shipping/global geo columns widen coverage when Customer only stores a subset
+        # of the available locations (for example, country names mapped into Province).
+        extend_distinct(cities, "Order_", "ShippingCity", "City")
+        extend_distinct(states, "Order_", "ShippingProvince", "State", "Country")
+        extend_distinct(cities, "GlobalOrder", "City", "ShippingCity")
+        extend_distinct(states, "GlobalOrder", "State", "Province", "Country", "shipping_country")
 
         cur.execute("SELECT DISTINCT Brand FROM Product WHERE Brand IS NOT NULL")
         brands = [r[0] for r in cur.fetchall()]
@@ -128,8 +193,8 @@ class EntityNormalizer:
         conn.close()
 
         entity_groups = {
-            "city":         cities,
-            "state":        states,
+            "city":         list(dict.fromkeys(cities)),
+            "state":        list(dict.fromkeys(states)),
             "brand":        brands,
             "category":     categories,
             "sub_category": sub_categories,
@@ -149,6 +214,10 @@ class EntityNormalizer:
         all_names  = [name  for items in entity_groups.values() for name  in items]
         all_groups = [group for group, items in entity_groups.items() for _ in items]
         total      = len(all_names)
+
+        self.collection = None
+        if not self.chroma or not self.embed_model:
+            return
 
         try:
             collection = self.chroma.get_collection(COLLECTION_NAME)
@@ -173,25 +242,29 @@ class EntityNormalizer:
         )
 
     # ─────────────────────────────────────────────
-    # 角色 embedding 预加载
+    # Role embedding preload
     # ─────────────────────────────────────────────
     def _load_role_embeddings(self):
-        """预计算 5 个非实体角色的 ROLE_EXAMPLES embedding，初始化时一次性完成"""
+        """Precompute ROLE_EXAMPLES embeddings for the 5 non-entity roles once at startup."""
         self.role_embeddings: dict[str, np.ndarray] = {}
+        if not self.embed_model or np is None:
+            return
         for role, examples in ROLE_EXAMPLES.items():
             vecs = self.embed_model.encode(examples, normalize_embeddings=True)
             self.role_embeddings[role] = vecs  # shape: (n_examples, dim)
 
     # ─────────────────────────────────────────────
-    # 短语角色分类
+    # Phrase role classification
     # ─────────────────────────────────────────────
     def _classify_phrase(self, phrase: str) -> tuple[str, Optional[dict]]:
         """
-        两阶段分类，返回 (role, chroma_result)。
-        - role: 角色名（time/metric/.../entity）
-        - chroma_result: ChromaDB top-2 查询结果，仅 entity 时有值，供 get_candidates 复用
+        Run a two-stage classifier and return (role, chroma_result).
+        - role: role name (time/metric/.../entity)
+        - chroma_result: cached ChromaDB top-2 result, only present for entity phrases
         """
-        # 阶段1：5 个非实体角色 embedding max 相似度
+        if not self.embed_model or not self.collection or np is None:
+            return "entity", None
+        # Stage 1: max embedding similarity against the 5 non-entity roles.
         phrase_vec = self.embed_model.encode([phrase], normalize_embeddings=True)
         best_role, best_score = "entity", 0.0
         for role, vecs in self.role_embeddings.items():
@@ -199,7 +272,7 @@ class EntityNormalizer:
             if score > best_score:
                 best_role, best_score = role, score
 
-        # 阶段2：ChromaDB 查 entity 相似度（结果缓存供 get_candidates 复用）
+        # Stage 2: query entity similarity from ChromaDB and cache it for reuse.
         res = self.collection.query(
             query_embeddings=phrase_vec.tolist(),
             n_results=2,
@@ -214,17 +287,46 @@ class EntityNormalizer:
         return best_role, None
 
     # ─────────────────────────────────────────────
-    # 短语提取
+    # Phrase extraction
     # ─────────────────────────────────────────────
     def _extract_phrases(self, query: str) -> tuple[list[str], list[str]]:
         """
-        用 spaCy 切分短语，返回 (noun_phrases, time_phrases)。
-        - noun_phrases: 名词短语，作为实体/指标等候选
-        - time_phrases: NER 识别的 DATE/TIME 表达，直接归 time 角色
+        Split the query with spaCy and return (noun_phrases, time_phrases).
+        - noun_phrases: noun phrases used as entity/metric/etc. candidates
+        - time_phrases: DATE/TIME expressions detected by NER and assigned directly to time
 
-        额外扫描：spaCy noun_chunk 基于依存句法，会遗漏介词后的缩写
-        （如 "in TX"、"from LA"），用 token 扫描补充全大写 token 和已知缩写。
+        Extra scan: spaCy noun_chunks are dependency-based and can miss abbreviations
+        after prepositions (for example "in TX" or "from LA"), so we add a token scan
+        for uppercase abbreviations and known aliases.
         """
+        if self.nlp is None:
+            tokens = re.findall(r"[A-Za-z][A-Za-z\-]*", query)
+            entity_keys = list(self.entity_map.keys())
+            noun_phrases = []
+            max_ngram = min(4, len(tokens))
+            for n in range(max_ngram, 0, -1):
+                for i in range(len(tokens) - n + 1):
+                    window = tokens[i:i + n]
+                    phrase = " ".join(window)
+                    lower = phrase.lower()
+                    if all(part.lower() in _STOPWORDS for part in window):
+                        continue
+                    if n == 1 and phrase in ABBREV_MAP:
+                        noun_phrases.append(phrase)
+                        continue
+                    if lower in self.entity_map:
+                        noun_phrases.append(phrase)
+                        continue
+                    match = fuzz_process.extractOne(
+                        lower,
+                        entity_keys,
+                        scorer=fuzz.ratio,
+                        score_cutoff=82 if n > 1 else 75,
+                    )
+                    if match:
+                        noun_phrases.append(phrase)
+            return list(dict.fromkeys(noun_phrases)), []
+
         doc          = self.nlp(query)
         noun_phrases = list(dict.fromkeys(
             chunk.text for chunk in doc.noun_chunks
@@ -237,8 +339,8 @@ class EntityNormalizer:
         time_set = {t.lower() for t in time_phrases}
         existing = set(noun_phrases)
 
-        # 第一轮补充：全大写缩写 / 已知缩写表（如 TX、LA、Cali）
-        # 介词后的地名缩写不会进入 noun_chunks，需要单独捞出来
+        # First pass: uppercase abbreviations and known aliases such as TX, LA, and Cali.
+        # Location abbreviations after prepositions often do not appear in noun_chunks.
         extra = [
             token.text for token in doc
             if token.text.isalpha()
@@ -249,11 +351,12 @@ class EntityNormalizer:
             and (token.text.isupper() or token.text in ABBREV_MAP)
         ]
 
-        # 第二轮补充：品牌错别字 token（spaCy 会把未知词误标为 VERB/ADP）
-        # 判断依据：spaCy token.prob 是词频对数概率
-        #   已知英语词（sales、phone）→ prob > -13
-        #   未知词/错别字（samsng、appel）→ prob ≈ -20
-        # 只对低概率 token 做 RapidFuzz，避免 "sales→Salem" 类假阳性
+        # Second pass: likely typo tokens for brands/entities. spaCy may tag unknown words
+        # as VERB/ADP, so use token.prob as a rough frequency signal:
+        #   common English words (sales, phone) -> prob > -13
+        #   unknown words / typos (samsng, appel) -> prob ~= -20
+        # Only low-probability tokens go through RapidFuzz to avoid false positives
+        # like "sales" -> "Salem".
         existing2 = existing | set(extra)
         entity_keys = list(self.entity_map.keys())
         fuzzy_extra = []
@@ -265,7 +368,7 @@ class EntityNormalizer:
                 or t.lower() in _STOPWORDS
                 or t.lower() in time_set
                 or t in existing2
-                or token.prob > -13          # 跳过已知英语词
+                or token.prob > -13          # Skip known English words.
             ):
                 continue
             match = fuzz_process.extractOne(
@@ -277,35 +380,40 @@ class EntityNormalizer:
         return list(dict.fromkeys(noun_phrases + extra + fuzzy_extra)), time_phrases
 
     # ─────────────────────────────────────────────
-    # 向量检索
+    # Vector retrieval
     # ─────────────────────────────────────────────
     def get_candidates(self, noun_phrases: list[str], time_phrases: list[str]) -> dict:
         """
-        对短语做两阶段角色分类，返回：
+        Apply two-stage role classification to phrases and return:
         {
           "pre_classified": {"time": ["last month"], "metric": ["sales"], ...},
           "candidates": {
-            "samsng": {"top1": {"name": "Samsung", "group": "品牌", "score": 0.85},
-                       "top2": {"name": "Samsonite", "group": "品牌", "score": 0.62}},
+            "samsng": {"top1": {"name": "Samsung", "group": "brand", "score": 0.85},
+                       "top2": {"name": "Samsonite", "group": "brand", "score": 0.62}},
             ...
           }
         }
-        time_phrases 由 spaCy NER 直接归入 time 角色，不走 embedding 分类。
-        精确匹配 all_entities 的短语跳过（无需纠错）。
-        entity 角色的 ChromaDB top-2 结果直接复用分类阶段的查询，不重复检索。
+        time_phrases are assigned directly to the time role by spaCy NER.
+        Exact matches in all_entities are skipped because they do not need correction.
+        For entity phrases, the ChromaDB top-2 result is reused from classification time.
         """
         pre_classified: dict[str, list[str]] = {}
         candidates: dict[str, dict] = {}
 
-        # time_phrases 直接归入 pre_classified，无需 embedding 分类
+        # time_phrases go straight into pre_classified without embedding classification.
         if time_phrases:
             pre_classified["time"] = time_phrases
 
         for phrase in noun_phrases:
             if phrase.lower() in self.all_entities:
+                info = self.entity_map[phrase.lower()]
+                candidates[phrase] = {
+                    "top1": {"name": info["name"], "group": info["group"], "score": 1.0},
+                    "top2": {"name": info["name"], "group": info["group"], "score": 1.0},
+                }
                 continue
 
-            # ── 预检索层 1：缩写字典直接映射 ──────────────────────────────
+            # ── Pre-retrieval layer 1: direct alias dictionary mapping ─────────────────
             if phrase in ABBREV_MAP:
                 canonical = ABBREV_MAP[phrase]
                 info = self.entity_map.get(canonical.lower())
@@ -316,9 +424,9 @@ class EntityNormalizer:
                     }
                     continue
 
-            # ── 预检索层 2：token 级 RapidFuzz（处理品牌错别字）────────────
-            # 对 noun chunk 内每个 token 单独做字符模糊匹配，避免整段短语
-            # 的语义向量被 "sales"/"orders" 等词拉偏导致误分类
+            # ── Pre-retrieval layer 2: token-level RapidFuzz for brand/entity typos ───
+            # Match tokens inside a noun chunk individually so words like "sales" or
+            # "orders" do not skew the full-phrase embedding toward the wrong role.
             entity_keys = list(self.entity_map.keys())
             fuzzy_hit: Optional[tuple[str, str, float]] = None
             for token in phrase.split():
@@ -341,14 +449,31 @@ class EntityNormalizer:
                 }
                 continue
 
-            # ── 原有路径：embedding 分类 + ChromaDB ────────────────────────
+            # ── Default path: embedding classification + ChromaDB ─────────────────────
+            if not self.embed_model or not self.collection:
+                entity_keys = list(self.entity_map.keys())
+                result = fuzz_process.extractOne(
+                    phrase.lower(),
+                    entity_keys,
+                    scorer=fuzz.ratio,
+                    score_cutoff=75,
+                )
+                if result:
+                    matched_key, score, _ = result
+                    info = self.entity_map[matched_key]
+                    candidates[phrase] = {
+                        "top1": {"name": info["name"], "group": info["group"], "score": score / 100},
+                        "top2": {"name": info["name"], "group": info["group"], "score": score / 100},
+                    }
+                continue
+
             role, chroma_res = self._classify_phrase(phrase)
 
             if role != "entity":
                 pre_classified.setdefault(role, []).append(phrase)
                 continue
 
-            # entity：用缓存的 ChromaDB 结果构建 top-2 候选
+            # For entity phrases, build top-2 candidates from the cached ChromaDB result.
             if chroma_res is None or not chroma_res["documents"][0]:
                 continue
 
@@ -365,7 +490,8 @@ class EntityNormalizer:
             top2 = to_candidate(chroma_res, 1) if len(docs) > 1 else top1
             candidates[phrase] = {"top1": top1, "top2": top2}
 
-        # 最长匹配去重：短语的 token 序列已被更长 entity candidate 覆盖则移除
+        # Longest-match dedupe: drop phrases whose token sequence is already covered
+        # by a longer entity candidate.
         def is_subphrase_of_entity(phrase: str) -> bool:
             phrase_tokens = phrase.lower().split()
             n = len(phrase_tokens)
@@ -378,9 +504,9 @@ class EntityNormalizer:
                         return True
             return False
 
-        # 去重 candidates 内部的子短语
+        # Remove covered subphrases inside candidates.
         candidates = {p: v for p, v in candidates.items() if not is_subphrase_of_entity(p)}
-        # 去重 pre_classified 中被 entity candidate 覆盖的子短语
+        # Remove pre_classified subphrases already covered by entity candidates.
         for role in pre_classified:
             pre_classified[role] = [
                 p for p in pre_classified[role] if not is_subphrase_of_entity(p)

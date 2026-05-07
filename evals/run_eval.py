@@ -1,17 +1,19 @@
 """
-Eval runner — 支持三种模式：
+Eval runner — supports three modes:
 
   python -m evals.run_eval --mode schema
-      只测 SchemaRAG 召回质量（不需要 API key）
+      Evaluate SchemaRAG retrieval quality only (no API key required)
 
   python -m evals.run_eval --mode full
-      运行完整 LangGraph pipeline 计算 Execution Match（需要 OPENAI_API_KEY）
+      Run the full LangGraph pipeline and compute Execution Match
+      (requires OPENAI_API_KEY)
 
   python -m evals.run_eval --mode entity --golden natural
-      测试 QueryNormalizer 实体纠错准确率（需要 OPENAI_API_KEY）
+      Evaluate QueryNormalizer entity-correction accuracy
+      (requires OPENAI_API_KEY)
 
   python -m evals.run_eval --config dense llm    (M1 baseline)
-  python -m evals.run_eval --config hybrid llm   (切换 retriever)
+  python -m evals.run_eval --config hybrid llm   (switch retriever)
   python -m evals.run_eval --config hybrid cross_encoder
 """
 
@@ -37,7 +39,7 @@ GOLDEN_FILES = {
     "natural":   "golden_queries_natural.jsonl",
 }
 REPORTS_DIR = Path(__file__).parent / "reports"
-DB_PATH = str(Path(__file__).parent.parent / "Ecommerce.db")
+DB_PATH = str(Path(__file__).parent.parent / "data" / "Ecommerce.db")
 
 
 def load_golden(golden: str = "standard"):
@@ -59,7 +61,13 @@ def run_schema_eval(retriever_type: str, reranker_type: str, golden: str = "stan
     from evals.metrics import schema_recall
     import impl  # noqa: F401
     from core.registry import create_retriever, create_reranker
-    from db_mcp_server.schema_rag import SchemaRAG, FIELD_DESCRIPTIONS, TABLE_DESCRIPTIONS
+    from db_mcp_server.schema_rag import (
+        SchemaRAG,
+        FIELD_DESCRIPTIONS,
+        TABLE_DESCRIPTIONS,
+        rank_tables_from_hits,
+        refine_candidate_tables,
+    )
 
     cfg = _build_settings(retriever_type, reranker_type)
 
@@ -78,18 +86,22 @@ def run_schema_eval(retriever_type: str, reranker_type: str, golden: str = "stan
         )
 
     golden_data = load_golden(golden)
+    if golden_data and "expected_tables" not in golden_data[0]:
+        raise ValueError(
+            f"Golden set '{golden}' does not define expected_tables. "
+            "Use --mode entity for entity-normalization datasets."
+        )
     results = []
     total_recall = 0.0
 
     for item in golden_data:
         hits = retriever.retrieve(item["question"], top_k=cfg.retriever.top_k * 4)
-        seen, retrieved = set(), []
-        for h in hits:
-            if h.table not in seen:
-                seen.add(h.table)
-                retrieved.append(h.table)
-            if len(retrieved) == cfg.retriever.final_tables:
-                break
+        retrieved = rank_tables_from_hits(hits, cfg.retriever.final_tables)
+        retrieved = refine_candidate_tables(
+            item["question"],
+            retrieved,
+            cfg.retriever.final_tables,
+        )
 
         if reranker:
             retrieved = reranker.rerank(item["question"], retrieved, top_k=cfg.reranker.top_k)
@@ -180,18 +192,22 @@ def run_full_eval(retriever_type: str, reranker_type: str, golden: str = "standa
 
 
 def run_entity_eval() -> dict:
-    """测试 QueryNormalizer 实体纠错准确率（需要 OPENAI_API_KEY）"""
+    """Evaluate QueryNormalizer entity-correction accuracy (requires OPENAI_API_KEY)."""
     from evals.metrics import entity_f1
-    from langchain_openai import ChatOpenAI
-    from config import settings
     from db_mcp_server.entity_normalizer import EntityNormalizer
     from db_mcp_server.query_normalizer import QueryNormalizer
 
-    llm = ChatOpenAI(
-        model=settings.llm.model,
-        temperature=0,
-        api_key=os.environ.get("OPENAI_API_KEY"),
-    )
+    llm = None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        from langchain_openai import ChatOpenAI
+        from config import settings
+
+        llm = ChatOpenAI(
+            model=settings.llm.model,
+            temperature=0,
+            api_key=api_key,
+        )
     qn = QueryNormalizer(llm, EntityNormalizer())
 
     golden_data = load_golden("natural")

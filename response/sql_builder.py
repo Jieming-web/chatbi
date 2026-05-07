@@ -35,17 +35,17 @@ class SQLBuilder:
 
         if error:
             user_content = (
-                f"问题：{normalized_query}\n"
-                + (f"\n查询意图解析：\n{roles_text}\n" if roles_text else "")
-                + f"\n上次生成的 SQL 执行出错：\n{prev_sql}\n"
-                f"错误信息：{error}\n\n"
-                f"请修复 SQL，只输出 SQL，不要任何解释："
+                f"Question: {normalized_query}\n"
+                + (f"\nIntent analysis:\n{roles_text}\n" if roles_text else "")
+                + f"\nThe previously generated SQL failed to execute:\n{prev_sql}\n"
+                f"Error message: {error}\n\n"
+                "Please fix the SQL. Output SQL only, with no explanation:"
             )
         else:
             user_content = (
-                f"问题：{normalized_query}\n"
-                + (f"\n查询意图解析：\n{roles_text}\n" if roles_text else "")
-                + "\nSQL："
+                f"Question: {normalized_query}\n"
+                + (f"\nIntent analysis:\n{roles_text}\n" if roles_text else "")
+                + "\nSQL:"
             )
 
         response = self.llm.invoke([

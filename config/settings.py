@@ -30,7 +30,7 @@ class LLMSettings(BaseModel):
 
 
 class DBSettings(BaseModel):
-    path: str = "Ecommerce.db"
+    path: str = "data/Ecommerce.db"
 
 
 class MCPSettings(BaseModel):

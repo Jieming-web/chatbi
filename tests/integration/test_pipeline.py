@@ -18,6 +18,10 @@ def rag():
     ("orders shipped to London", ["Order_"]),
     ("most common payment method", ["OrderExtra"]),
     ("top US states by sales", ["GlobalOrder"]),
+    ("top 5 brands by revenue in Q1 2025", ["Order_", "OrderItem", "Product"]),
+    ("average fraud risk score by customer segment", ["Order_", "OrderExtra", "Customer"]),
+    ("average delivery days for electronics orders", ["OrderExtra", "Order_", "OrderItem", "Product", "Category"]),
+    ("top 5 sub-categories by revenue from high loyalty customers", ["Order_", "OrderItem", "Product", "Category", "Customer"]),
 ])
 def test_schema_retrieval_includes_key_tables(rag, question, expected_tables):
     ctx = rag.retrieve(question)

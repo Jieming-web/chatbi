@@ -21,7 +21,7 @@ _ALL_TABLES = [
 
 @mcp.tool()
 def get_table_schema() -> str:
-    """获取电商数据库所有表的 SQLite Schema，生成SQL之前必须先调用该工具获取完整表结构"""
+    """Return the SQLite schema for all ecommerce tables. Call this before generating SQL."""
     table_schema = []
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -37,7 +37,7 @@ def get_table_schema() -> str:
         col_names = [col[1] for col in columns]
         example = ""
         if rows:
-            example = "\n  -- 示例: " + " | ".join(col_names) + "\n"
+            example = "\n  -- Example: " + " | ".join(col_names) + "\n"
             for row in rows:
                 example += "  --        " + " | ".join(str(v) for v in row) + "\n"
         table_schema.append(f'CREATE TABLE "{table}" ({col_defs}){example}')
@@ -47,17 +47,17 @@ def get_table_schema() -> str:
 
 @mcp.tool()
 def run_sql(sql: str) -> str:
-    """执行 SQLite SQL 语句查询电商数据，一次仅能执行一句 SQL！注意：订单表名为 Order_（加下划线）"""
+    """Execute one SQLite query against the ecommerce data. Note: the orders table is named Order_."""
     try:
         result = query(sql)
         return str(result)
     except Exception as e:
-        return f"执行SQL错误：{str(e)}，请修正后重新发起。"
+        return f"SQL execution error: {str(e)}. Please fix the query and try again."
 
 
 @mcp.tool()
 def normalize_query(question: str) -> str:
-    """对用户问题做实体标准化：纠正品牌/商品/城市拼写错误，返回标准化后的查询和角色分类"""
+    """Normalize user questions by correcting brand/product/city typos and returning roles."""
     from entity_normalizer import EntityNormalizer
     normalizer = EntityNormalizer()
     noun_phrases, time_phrases = normalizer._extract_phrases(question)
@@ -67,7 +67,7 @@ def normalize_query(question: str) -> str:
 
 @mcp.tool()
 def retrieve_schema(question: str) -> str:
-    """根据自然语言问题检索最相关的表结构（两阶段 RAG），返回 DDL + JOIN 路径"""
+    """Retrieve the most relevant schema for a natural-language question and return DDL plus JOIN paths."""
     from db_mcp_server.schema_rag import SchemaRAG
     rag = SchemaRAG()
     ctx = rag.retrieve(question)
@@ -87,13 +87,13 @@ def retrieve_schema(question: str) -> str:
 
 @mcp.resource("schema://tables")
 def schema_tables() -> str:
-    """完整表结构（所有 9 张表的 DDL）"""
+    """Full schema for all 9 tables."""
     return get_table_schema()
 
 
 @mcp.resource("schema://relationships")
 def schema_relationships() -> str:
-    """外键关系列表"""
+    """List of foreign-key relationships."""
     from db_mcp_server.schema_rag import FOREIGN_KEYS
     lines = ["# Foreign Key Relationships\n"]
     for src_table, src_col, dst_table, dst_col in FOREIGN_KEYS:
@@ -103,32 +103,32 @@ def schema_relationships() -> str:
 
 @mcp.resource("examples://sql")
 def sql_examples() -> str:
-    """Few-shot SQL 示例"""
+    """Few-shot SQL examples."""
     return """# SQL Examples
 
-## 示例1：品类销售额排行
-问题：哪个品类的销售额最高？
-SQL：
-SELECT c.Name AS 品类, SUM(oi.UnitPrice * oi.Quantity * oi.Discount) AS 销售额
+## Example 1: Category revenue ranking
+Question: Which category has the highest revenue?
+SQL:
+SELECT c.Name AS category, SUM(oi.UnitPrice * oi.Quantity * oi.Discount) AS revenue
 FROM OrderItem oi
 JOIN Product p ON oi.ProductId = p.ProductId
 JOIN Category c ON p.CategoryId = c.CategoryId
 GROUP BY c.Name
-ORDER BY 销售额 DESC
+ORDER BY revenue DESC
 LIMIT 1;
 
-## 示例2：高频购买客户
-问题：下单超过3次的客户有哪些？
-SQL：
-SELECT cu.Name, cu.City, COUNT(o.OrderId) AS 下单次数
+## Example 2: Frequent buyers
+Question: Which customers have placed more than 3 orders?
+SQL:
+SELECT cu.Name, cu.City, COUNT(o.OrderId) AS order_count
 FROM Customer cu
 JOIN Order_ o ON cu.CustomerId = o.CustomerId
 GROUP BY cu.CustomerId
 HAVING COUNT(o.OrderId) > 3
-ORDER BY 下单次数 DESC;
+ORDER BY order_count DESC;
 
-## 示例3：品牌退货率
-问题：各品牌退货率？
+## Example 3: Return rate by brand
+Question: What is the return rate for each brand?
 SQL：
 SELECT p.Brand,
        ROUND(SUM(CASE WHEN o.Status = 'returned' THEN 1.0 ELSE 0 END) / COUNT(*), 4) AS return_rate
@@ -144,22 +144,22 @@ ORDER BY return_rate DESC;
 
 @mcp.prompt()
 def analyze_query(question: str) -> str:
-    """标准分析流程模板：给定用户问题，生成结构化的分析步骤提示"""
-    return f"""你是电商数据分析助手，请按以下步骤回答用户问题：
+    """Return a structured analysis workflow prompt for a given user question."""
+    return f"""You are an ecommerce data analysis assistant. Answer the user's question with the following steps:
 
-用户问题：{question}
+User question: {question}
 
-步骤：
-1. 调用 normalize_query 工具标准化实体词
-2. 调用 retrieve_schema 工具获取相关表结构
-3. 根据表结构和 JOIN 路径生成 SQL
-4. 调用 run_sql 工具执行 SQL 并返回结果
-5. 用自然语言解释查询结果
+Steps:
+1. Call the normalize_query tool to standardize entity terms.
+2. Call the retrieve_schema tool to fetch the relevant schema.
+3. Generate SQL using the schema and JOIN paths.
+4. Call the run_sql tool to execute the SQL and return the result.
+5. Explain the result in natural language.
 
-注意：
-- 订单表名为 Order_（加下划线）
-- 金额计算：UnitPrice × Quantity × Discount
-- 时间格式：'YYYY-MM-DD'
+Notes:
+- The orders table is named Order_.
+- Amount calculation: UnitPrice * Quantity * Discount
+- Date format: 'YYYY-MM-DD'
 """
 
 

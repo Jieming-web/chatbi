@@ -1,8 +1,10 @@
 """
 Schema RAG orchestrator
 -----------------------
-两阶段召回：Retriever (top-k 字段 → 候选表) + Reranker (收敛至最少必要表) + JOIN path 推导。
-Retriever/Reranker 具体实现通过 core/registry.py 按 settings.yaml 可插拔选择。
+Two-stage retrieval: Retriever (top-k fields -> candidate tables) + Reranker
+(reduce to the minimum necessary tables) + JOIN path inference.
+Retriever/Reranker implementations are selected through core/registry.py based
+on the pluggable settings.yaml configuration.
 """
 
 import sqlite3
@@ -11,15 +13,15 @@ from typing import Dict, List, Tuple
 
 from config import settings
 from core.registry import create_retriever, create_reranker
-import impl  # noqa: F401  触发 retriever/reranker 装饰器注册
+import impl  # noqa: F401  Triggers retriever/reranker decorator registration
 from db_mcp_server.utils import DB_PATH
 
 
 FIELD_DESCRIPTIONS = [
     # ── Category ──────────────────────────────────────────────────────────
     ("Category", "CategoryId",       "primary key of the category — use to JOIN with Product.CategoryId"),
-    ("Category", "Name",             "category or sub-category name e.g. Electronics, Clothing, Smartphones, Women's Apparel, Sneakers, Footwear, Shoes, Sportswear — use when filtering or grouping by product type or category"),
-    ("Category", "ParentCategoryId", "parent category FK — NULL for top-level categories; use to distinguish parent category from sub-category"),
+    ("Category", "Name",             "category or sub-category name e.g. Electronics, Clothing, Smartphones, Women's Apparel, Sneakers, Footwear, Shoes, Sportswear — use when filtering or grouping by product type, electronics orders, parent category, or sub-category"),
+    ("Category", "ParentCategoryId", "parent category FK — NULL for top-level categories; use to distinguish parent category from sub-category and to roll sub-categories up to parent categories"),
 
     # ── Product ───────────────────────────────────────────────────────────
     ("Product", "ProductId",  "primary key of the product — use to JOIN with OrderItem.ProductId or Review.ProductId"),
@@ -37,27 +39,36 @@ FIELD_DESCRIPTIONS = [
     ("Customer", "RegisterDate",  "date the customer account was created — use for cohort analysis or customer tenure queries"),
     ("Customer", "Gender",        "gender of the customer: Male, Female — use for demographic breakdown"),
     ("Customer", "Age",           "age of the customer — use when filtering or grouping by age group"),
-    ("Customer", "Segment",       "customer tier: Regular, Premium, VIP, New — use for segmentation or loyalty analysis"),
-    ("Customer", "LoyaltyScore",  "numeric loyalty score — use for average loyalty or top-loyalty customer queries"),
+    ("Customer", "Segment",       "customer tier: Regular, Premium, VIP, New — use for customer segment analysis or filtering orders placed by VIP or premium customers"),
+    ("Customer", "LoyaltyScore",  "numeric loyalty score — use for average loyalty, high loyalty customers, or top-loyalty customer queries"),
 
     # ── Order_ ────────────────────────────────────────────────────────────
     ("Order_", "OrderId",          "primary key of the order — use to JOIN with OrderItem.OrderId or OrderExtra.OrderId"),
-    ("Order_", "CustomerId",       "FK to Customer — use to JOIN orders with customer profile"),
-    ("Order_", "OrderDate",        "date the order was placed — use for time-range filtering, monthly trends, or year-over-year analysis"),
+    ("Order_", "CustomerId",       "FK to Customer — use to JOIN orders with customer profile, customer segment, loyalty score, or customer location"),
+    ("Order_", "OrderDate",        "date the order was placed — use for time-range filtering, monthly trends, quarter filters like Q1 2025, or year-over-year analysis"),
     ("Order_", "Status",           "fulfilment status: Delivered, Shipped, Pending, Cancelled, Returned — use for return rate, cancellation rate, or filtering by order outcome"),
-    ("Order_", "TotalAmount",      "total revenue paid by the customer in USD after discount — use for revenue, sales amount, or GMV queries"),
+    ("Order_", "TotalAmount",      "total revenue paid by the customer in USD after discount — use for revenue, sales amount, GMV, or order value queries"),
     ("Order_", "ShippingCity",     "city the order was shipped to — use when filtering orders by destination city"),
     ("Order_", "ShippingProvince", "US state the order was shipped to — use when filtering orders by destination state"),
     ("Order_", "Priority",         "priority level of the order: High, Medium, Low — use when query asks about high-priority or urgent orders"),
     ("Order_", "IsWeekend",        "1 if the order was placed on a weekend, 0 otherwise — use for weekend vs weekday comparison"),
 
+    # ── GlobalOrder ───────────────────────────────────────────────────────
+    ("GlobalOrder", "OrderId",     "primary key of the global order record"),
+    ("GlobalOrder", "Country",     "country name for the order destination in global geography rollups — use when query explicitly compares countries or asks for geo-wide sales"),
+    ("GlobalOrder", "State",       "state or province for global geography reporting — use when grouping or ranking US states in location-focused sales analysis"),
+    ("GlobalOrder", "City",        "city in the global geography rollup table — use for city-level geographic summaries"),
+    ("GlobalOrder", "OrderDate",   "date of the global order record — use for time-range trends on global geography reports"),
+    ("GlobalOrder", "Status",      "status for global order reporting such as delivered or cancelled"),
+    ("GlobalOrder", "TotalAmount", "order amount for country/state/city rollups in the global geography table — prefer Order_ for normal order analytics"),
+
     # ── OrderItem ─────────────────────────────────────────────────────────
     ("OrderItem", "OrderItemId", "primary key of the order line item"),
-    ("OrderItem", "OrderId",     "FK to Order_ — use to JOIN order items with order header"),
-    ("OrderItem", "ProductId",   "FK to Product — use to JOIN order items with product details"),
+    ("OrderItem", "OrderId",     "FK to Order_ — use to JOIN order items with order header when combining products with order date, customer, status, or payment/shipping attributes"),
+    ("OrderItem", "ProductId",   "FK to Product — use to JOIN order items with product details, brand, or category"),
     ("OrderItem", "SkuId",       "FK to SKU — use when query asks about specific product variants (color, size, storage)"),
-    ("OrderItem", "Quantity",    "number of units purchased in this line item — use for total units sold or bestseller ranking"),
-    ("OrderItem", "UnitPrice",   "price per unit at the time of purchase in USD — use for revenue calculation: UnitPrice * Quantity * Discount"),
+    ("OrderItem", "Quantity",    "number of units purchased in this line item — use for total units sold, quantity sold, bestseller ranking, or product sales by customer/location"),
+    ("OrderItem", "UnitPrice",   "price per unit at the time of purchase in USD — use for line-item revenue calculation by brand, category, or sub-category: UnitPrice * Quantity * Discount"),
     ("OrderItem", "Discount",    "discount coefficient applied (e.g. 0.9 means 10% off) — revenue = UnitPrice * Quantity * Discount"),
 
     # ── OrderExtra ────────────────────────────────────────────────────────
@@ -97,15 +108,71 @@ FIELD_DESCRIPTIONS = [
 ]
 
 TABLE_DESCRIPTIONS = {
-    "Category":   "product taxonomy with parent-child hierarchy — CategoryId, Name, ParentCategoryId. Top-level rows (ParentCategoryId IS NULL) are parent categories e.g. Electronics, Clothing; child rows are sub-categories e.g. Smartphones, Women's Apparel. JOIN to Product via Product.CategoryId.",
+    "Category":   "product taxonomy with parent-child hierarchy — CategoryId, Name, ParentCategoryId. Top-level rows (ParentCategoryId IS NULL) are parent categories e.g. Electronics, Clothing; child rows are sub-categories e.g. Smartphones, Women's Apparel. JOIN to Product via Product.CategoryId when a query asks about category, sub-category, or parent-category rollups.",
     "Product":    "product master table — ProductId, Name, CategoryId, Brand, Price, Stock, Status. One row per distinct product (1000 products). JOIN to Category for category name, to OrderItem for sales data, to Review for ratings, to SKU for variants.",
-    "Customer":   "customer profile table — CustomerId, Name, City, Province, RegisterDate, Gender, Age, Segment, LoyaltyScore. One row per customer (1000 customers). JOIN to Order_ for purchase history, to Review for reviews written.",
-    "Order_":     "order header table (note underscore: ORDER is a SQL reserved word) — OrderId, CustomerId, OrderDate, Status, TotalAmount, ShippingCity, ShippingProvince, Priority, IsWeekend. One row per order (1003 orders). JOIN to Customer, OrderItem, OrderExtra.",
-    "OrderItem":  "order line items — OrderItemId, OrderId, ProductId, SkuId, Quantity, UnitPrice, Discount. Revenue = UnitPrice * Quantity * Discount. One row per product line per order. JOIN to Order_, Product, SKU.",
+    "Customer":   "customer profile table — CustomerId, Name, City, Province, RegisterDate, Gender, Age, Segment, LoyaltyScore. One row per customer (1000 customers). JOIN to Order_ for purchase history, customer segment, loyalty, and geography filters; JOIN to Review for reviews written.",
+    "Order_":     "order header table (note underscore: ORDER is a SQL reserved word) — OrderId, CustomerId, OrderDate, Status, TotalAmount, ShippingCity, ShippingProvince, Priority, IsWeekend. One row per order (1003 orders). Use this table whenever a question mixes products with customer attributes, order dates, order value, or order status. JOIN to Customer, OrderItem, OrderExtra.",
+    "GlobalOrder":"global geography fact table — OrderId, Country, State, City, OrderDate, Status, TotalAmount. Prefer this table only for explicitly location-focused country/state/city sales questions; prefer Order_ for normal order analytics.",
+    "OrderItem":  "order line items — OrderItemId, OrderId, ProductId, SkuId, Quantity, UnitPrice, Discount. Revenue = UnitPrice * Quantity * Discount. One row per product line per order. Use this table for product-level revenue, quantity sold, brand/category/sub-category rollups, or any query about which customers bought which products. JOIN to Order_, Product, SKU.",
     "OrderExtra": "extended order attributes — OrderId, PaymentMethod, PaymentStatus, ShippingMethod, ShippingCostUSD, DeliveryDays, DeliveryStatus, WarehouseLocation, CampaignSource, DeviceType, TrafficSource, FraudRiskScore, CouponUsed, CouponCode, ReturnReason. One-to-one with Order_.",
     "Review":     "customer product reviews — ReviewId, CustomerId, ProductId, Rating (1-5), Content, CreateDate. One row per review. JOIN to Customer and Product.",
     "SKU":        "product variant table — SkuId, ProductId, Color, Storage, Size, Price, Stock, Status. One row per variant (3190 SKUs, ~3 per product). JOIN to Product and OrderItem.",
 }
+
+
+def rank_tables_from_hits(hits, limit: int) -> List[str]:
+    """Select unique tables in hit order."""
+    seen, tables = set(), []
+    for hit in hits:
+        if hit.table in seen:
+            continue
+        seen.add(hit.table)
+        tables.append(hit.table)
+        if len(tables) == limit:
+            break
+    return tables
+
+
+def _contains_any(text: str, phrases: List[str]) -> bool:
+    text = text.lower()
+    return any(phrase in text for phrase in phrases)
+
+
+def refine_candidate_tables(query: str, candidate_tables: List[str], limit: int) -> List[str]:
+    query_l = query.lower()
+    boosts: List[str] = []
+
+    has_geo = _contains_any(query_l, [" state", " states", " city", " cities", " country", " countries", "province", "geo", "geography", "us "])
+    has_category = _contains_any(query_l, ["category", "sub-category", "subcategory", "electronics", "clothing", "sneakers", "shoes", "sportswear", "smartphones"])
+    has_product_metric = _contains_any(query_l, ["brand", "brands", "product", "products", "quantity", "sold", "sales", "revenue", "rating", "review"])
+    has_customer_filter = _contains_any(query_l, ["customer", "customers", "vip", "segment", "loyalty", "loyal"])
+    has_order_time = _contains_any(query_l, ["q1", "q2", "q3", "q4", "quarter", "month", "year", "2024", "2025"])
+    has_order_extra = _contains_any(query_l, ["delivery", "shipping", "payment", "warehouse", "fraud", "device", "mobile"])
+
+    if has_category:
+        boosts.extend(["Category", "Product"])
+    if has_product_metric:
+        boosts.extend(["OrderItem", "Product"])
+    if has_customer_filter and (has_product_metric or has_order_extra):
+        boosts.extend(["Order_", "Customer"])
+    if has_order_time and _contains_any(query_l, ["revenue", "sales", "return", "status", "cancel", "deliv"]):
+        boosts.append("Order_")
+    if has_order_extra:
+        boosts.extend(["OrderExtra", "Order_"])
+        if has_category or has_product_metric:
+            boosts.extend(["OrderItem", "Product"])
+
+    ordered: List[str] = []
+    for table in boosts + candidate_tables:
+        if table == "GlobalOrder" and not has_geo:
+            continue
+        if table not in ordered:
+            ordered.append(table)
+
+    if "GlobalOrder" in candidate_tables and has_geo and "GlobalOrder" not in ordered:
+        ordered.append("GlobalOrder")
+
+    return ordered[:limit]
 
 FOREIGN_KEYS = [
     # (src_table, src_col, dst_table, dst_col)
@@ -146,15 +213,7 @@ class SchemaRAG:
             self.fk_graph[dst_table].append((src_table, dst_col, src_col, dst_table))
 
     def _candidate_tables_from_hits(self, hits) -> List[str]:
-        seen, tables = set(), []
-        for h in hits:
-            if h.table in seen:
-                continue
-            seen.add(h.table)
-            tables.append(h.table)
-            if len(tables) == self.retriever_cfg.final_tables:
-                break
-        return tables
+        return rank_tables_from_hits(hits, self.retriever_cfg.final_tables)
 
     def _stage2_join_paths(self, candidate_tables: List[str]) -> List[str]:
         if len(candidate_tables) <= 1:
@@ -198,7 +257,7 @@ class SchemaRAG:
         return []
 
     def _get_table_structured(self, table: str) -> dict:
-        """返回结构化表信息（DDL + 业务描述 + 示例数据行）"""
+        """Return structured table info including DDL, business description, and sample rows."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(f'PRAGMA table_info("{table}")')
@@ -219,7 +278,7 @@ class SchemaRAG:
 
     def retrieve(self, query: str) -> dict:
         """
-        两阶段 RAG 召回，返回结构化 SchemaContext：
+        Run two-stage RAG retrieval and return a structured SchemaContext:
         {
             "tables": [{"name", "ddl", "columns", "sample_rows"}, ...],
             "join_paths": ["TableA.col = TableB.col", ...]
@@ -227,6 +286,11 @@ class SchemaRAG:
         """
         hits = self.retriever.retrieve(query, top_k=self.retriever_cfg.top_k * 4)
         candidate_tables = self._candidate_tables_from_hits(hits)
+        candidate_tables = refine_candidate_tables(
+            query,
+            candidate_tables,
+            self.retriever_cfg.final_tables,
+        )
         candidate_tables = self.reranker.rerank(
             query, candidate_tables, top_k=self.reranker_cfg.top_k
         )

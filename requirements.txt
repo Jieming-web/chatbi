@@ -12,3 +12,4 @@ pydantic
 rank_bm25
 sentence-transformers
 rapidfuzz
+streamlit

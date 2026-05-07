@@ -28,10 +28,11 @@ class LLMReranker(BaseReranker):
         )
         prompt = (
             f"Query: {query}\n\n"
-            f"候选表：\n{table_lines}\n\n"
-            f"请选出回答该问题所需的最少表集合，只选必要的表。\n"
-            f"以 JSON 数组格式返回表名，例如：[\"Order_\", \"OrderItem\"]\n"
-            f"只返回 JSON，不要其他内容。"
+            f"Candidate tables:\n{table_lines}\n\n"
+            "Select the minimum set of tables needed to answer the question. "
+            "Choose only necessary tables.\n"
+            'Return table names as a JSON array, for example: ["Order_", "OrderItem"]\n'
+            "Return JSON only, with no extra text."
         )
         try:
             response = self.llm.invoke([HumanMessage(content=prompt)])
